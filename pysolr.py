@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import, print_function, unicode_literals
+from __future__ import print_function
+from __future__ import unicode_literals
+from __future__ import absolute_import
 
-import ast
+import os
 import datetime
 import logging
-import os
 import re
-import time
-# We can remove ExpatError when we drop support for Python 2.6:
-from xml.parsers.expat import ExpatError
-
 import requests
+import time
+import types
+import ast
 
 try:
-    from xml.etree import ElementTree as ET
+    # Prefer lxml, if installed.
+    from lxml import etree as ET
 except ImportError:
-    raise ImportError("No suitable ElementTree implementation was found.")
-
-# Remove this when we drop Python 2.6:
-ParseError = getattr(ET, 'ParseError', SyntaxError)
+    try:
+        from xml.etree import cElementTree as ET
+    except ImportError:
+        raise ImportError("No suitable ElementTree implementation was found.")
 
 try:
     # Prefer simplejson, if installed.
@@ -39,12 +40,6 @@ try:
 except ImportError:
     # Python 2.X
     import htmlentitydefs as htmlentities
-
-try:
-    # Python 3.X
-    from http.client import HTTPException
-except ImportError:
-    from httplib import HTTPException
 
 try:
     # Python 2.X
@@ -221,7 +216,7 @@ class SolrError(Exception):
 class Results(object):
     def __init__(self, docs, hits, highlighting=None, facets=None,
                  spellcheck=None, stats=None, qtime=None, debug=None,
-                 grouped=None):
+                 grouped=None, nextCursorMark=None):
         self.docs = docs
         self.hits = hits
         self.highlighting = highlighting or {}
@@ -231,6 +226,7 @@ class Results(object):
         self.qtime = qtime
         self.debug = debug or {}
         self.grouped = grouped or {}
+        self.nextCursorMark = nextCursorMark or None
 
     def __len__(self):
         return len(self.docs)
@@ -296,14 +292,14 @@ class Solr(object):
         except AttributeError as err:
             raise SolrError("Unable to send HTTP method '{0}.".format(method))
 
-        # Everything except the body can be Unicode. The body must be
-        # encoded to bytes to work properly on Py3.
-        bytes_body = body
-
-        if bytes_body is not None:
-            bytes_body = force_bytes(body)
-
         try:
+            # Everything except the body can be Unicode. The body must be
+            # encoded to bytes to work properly on Py3.
+            bytes_body = body
+
+            if bytes_body is not None:
+                bytes_body = force_bytes(body)
+
             resp = requests_method(url, data=bytes_body, headers=headers, files=files,
                                    timeout=self.timeout)
         except requests.exceptions.Timeout as err:
@@ -315,10 +311,6 @@ class Solr(object):
             params = (url, err)
             self.log.error(error_message, *params, exc_info=True)
             raise SolrError(error_message % params)
-        except HTTPException as err:
-            error_message = "Unhandled error: %s %s: %s"
-            self.log.error(error_message, method, url, err, exc_info=True)
-            raise SolrError(error_message % (method, url, err))
 
         end_time = time.time()
         self.log.info("Finished '%s' (%s) with body '%s' in %0.3f seconds.",
@@ -436,40 +428,35 @@ class Solr(object):
             server_type = 'jetty'
 
         if server_string and 'coyote' in server_string.lower():
+            import lxml.html
             server_type = 'tomcat'
 
         reason = None
         full_html = ''
         dom_tree = None
 
-        if response.startswith('<?xml'):
-            # Try a strict XML parse
-            try:
-                soup = ET.fromstring(response)
-
-                reason_node = soup.find('lst[@name="error"]/str[@name="msg"]')
-                tb_node = soup.find('lst[@name="error"]/str[@name="trace"]')
-                if reason_node is not None:
-                    full_html = reason = reason_node.text.strip()
-                if tb_node is not None:
-                    full_html = tb_node.text.strip()
-                    if reason is None:
-                        reason = full_html
-
-                # Since we had a precise match, we'll return the results now:
-                if reason and full_html:
-                    return reason, full_html
-            except (ParseError, ExpatError):
-                # XML parsing error, so we'll let the more liberal code handle it.
-                pass
-
         if server_type == 'tomcat':
-            # Tomcat doesn't produce a valid XML response or consistent HTML:
-            m = re.search(r'<(h1)[^>]*>\s*(.+?)\s*</\1>', response, re.IGNORECASE)
-            if m:
-                reason = m.group(2)
-            else:
-                full_html = "%s" % response
+            # Tomcat doesn't produce a valid XML response
+            soup = lxml.html.fromstring(response)
+            body_node = soup.find('body')
+            p_nodes = body_node.cssselect('p')
+
+            for p_node in p_nodes:
+                children = p_node.getchildren()
+
+                if len(children) >= 2 and 'message' in children[0].text.lower():
+                    reason = children[1].text
+
+                if len(children) >= 2 and hasattr(children[0], 'renderContents'):
+                    if 'description' in children[0].renderContents().lower():
+                        if reason is None:
+                            reason = children[1].renderContents()
+                        else:
+                            reason += ", " + children[1].renderContents()
+
+            if reason is None:
+                from lxml.html.clean import clean_html
+                full_html = clean_html(response)
         else:
             # Let's assume others do produce a valid XML response
             try:
@@ -487,7 +474,7 @@ class Solr(object):
 
                 if reason is None:
                     full_html = ET.tostring(dom_tree)
-            except (SyntaxError, ExpatError) as err:
+            except SyntaxError as err:
                 full_html = "%s" % response
 
         full_html = force_unicode(full_html)
@@ -654,6 +641,9 @@ class Solr(object):
         if result.get('grouped'):
             result_kwargs['grouped'] = result['grouped']
 
+        if result.get('nextCursorMark'):
+            result_kwargs['nextCursorMark'] = result['nextCursorMark']
+
         response = result.get('response') or {}
         numFound = response.get('numFound', 0)
         self.log.debug("Found '%s' search results.", numFound)
@@ -817,7 +807,8 @@ class Solr(object):
         Deletes documents.
 
         Requires *either* ``id`` or ``query``. ``id`` is if you know the
-        specific document id to remove. ``query`` is a Lucene-style query
+        specific document id to remove. Note that ``id`` can also be a list of
+        document ids to be deleted. ``query`` is a Lucene-style query
         indicating a collection of documents to delete.
 
         Optionally accepts ``commit``. Default is ``True``.
@@ -829,6 +820,7 @@ class Solr(object):
         Usage::
 
             solr.delete(id='doc_12')
+            solr.delete(id=['doc_1', 'doc_3'])
             solr.delete(q='*:*')
 
         """
@@ -837,7 +829,12 @@ class Solr(object):
         elif id is not None and q is not None:
             raise ValueError('You many only specify "id" OR "q", not both.')
         elif id is not None:
-            m = '<delete><id>%s</id></delete>' % id
+            m = '<delete>'
+            if type(id) not in (list, set):
+                id = [ id ]
+            for i in id:
+                m += '<id>%s</id>' % i
+            m += '</delete>'
         elif q is not None:
             m = '<delete><query>%s</query></delete>' % q
 
